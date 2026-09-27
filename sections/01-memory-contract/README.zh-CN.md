@@ -1,34 +1,27 @@
-# 1 · Memory contract
+# 1 · 记忆系统的接口约定（Memory contract）
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · **简体中文**
 
-> 先做两个决定，再谈机制：这份 memory 是谁的？用什么接口把背后的运作藏起来？
+> 实现之前，先想清楚两件事：这份记忆属于谁？其他程序通过什么接口使用它？
 
-这一章是 [Production memory](../../README.zh-CN.md) track 的第一章：
-lifecycle 的 Scope，加上核心抽象里的 engine 接口。
-这里写的 `contract.py`，后面每一章都会继续沿用。
+这是[生产环境中的记忆系统](../../README.zh-CN.md)教程的第一章。我们先定义数据的归属范围（Scope）和记忆引擎的接口。这里写下的 `contract.py`，后面的每一章都会用到。
 
-memory 系统最严重的事故不是检索出错，而是 scope 出错：
-A 用户的个人数据，出现在 B 用户的对话里。
-这种问题靠调检索没有用：内容抓得越准，泄露就越严重。
+记忆系统里，数据归属弄错了，往往比检索不准更严重。比如，A 用户的个人信息出现在了 B 用户的对话里。这种问题不能靠优化检索解决：找得越准，反而可能泄露得越多。
 
-第二个决定是接口。memory 背后有十章的机制在跑，但 harness 用起来只该有三个动词。
-调用方一旦直接查 index，这个 index 就动不了了：一改就会弄坏调用方，从此重建不了也换不掉，
-track 的铁律（事件永远留着，view 随时可重建）也就失守了。
+还要提前确定调用接口。记忆系统内部会逐步加入十章的功能，但调用它的 agent 运行框架（harness）只需要使用三个方法。如果调用方直接查询内部索引，就会依赖索引的具体结构。以后改结构、换实现或重建索引，都可能影响调用方，也就很难保证“保留原始事件，随时重建视图”。
 
-所以先定两条约定，再谈机制：
+因此，本章先定下两条约定：
 
-1. 每笔数据都标 scope，每次读取都用 scope 过滤。
-2. 读写一律走 `observe`、`recall`、`consolidate` 三个动词。
+1. 每条数据都标明归属范围，每次读取都按这个范围筛选。
+2. 读写统一通过 `observe`、`recall`、`consolidate` 三个方法完成。
 
 ---
 
-## 机制
+## 实现机制
 
-最简单的版本只有两样东西：一个 frozen dataclass，一个 protocol。
+最小实现只需要一个不可变的数据类（frozen dataclass）和一份接口协议（Protocol）。
 
-Scope 回答的是「这笔 memory 属于谁」。它声明成 frozen，因为 scope 本身就是一种身份：
-可以当 dict 的 key，也不怕传到一半被改掉：
+`Scope` 用来说明“这条记忆属于谁”。它代表数据的身份，因此创建后不允许修改。这样既可以把它用作字典的键，也不用担心它在传递过程中被改动：
 
 ```python
 @dataclass(frozen=True)
@@ -38,11 +31,9 @@ class Scope:
     agent_id: str | None = None
 ```
 
-三个字段一层套一层：tenant 底下有很多 user，一个 user 可能跑好几个 agent。
-留 `None` 是放宽范围（比如整个 tenant 一起读），填了值就是收窄。只有 tenant 必填。
+三个字段从大到小限定范围：一个租户（tenant）下可以有多个用户，一个用户可以使用多个 agent。只有 `tenant_id` 必填。其他字段填 `None` 表示不按这一层限制，例如查询整个租户的数据；填入具体值，则进一步缩小范围。
 
-engine 接口就是三个动词，用 `Protocol` 定义。
-判定看结构：有这三个方法的对象就是 engine，不用继承任何东西：
+记忆引擎通过 `Protocol` 定义三个方法。这里采用结构化的接口判断：对象只要具有这三个方法，就可以作为引擎使用，不需要继承指定的基类：
 
 ```python
 @runtime_checkable
@@ -52,71 +43,62 @@ class MemoryEngine(Protocol):
     def consolidate(self, scope: Scope) -> dict: ...
 ```
 
-每个动词各管 lifecycle 的一段：
+三个方法各自负责记忆处理流程的一部分：
 
 ```text
-observe      raw evidence in            capture, gate, encode      (sections 2-4)
-recall       evidence-backed text out   index, retrieve, assemble  (sections 7-9)
-consolidate  background maintenance     resolve, consolidate       (sections 5-6, cold clock)
+observe      接收原始证据      采集、审核写入、生成记录     第 2—4 章
+recall       返回有证据的文字  索引、检索、组装上下文       第 7—9 章
+consolidate  在后台维护记忆    处理冲突、合并整理           第 5—6 章，冷路径
 ```
 
-接口刻意做小，守的就是那条铁律。调用方只看得到动词，动词后面的东西全都可以换：
-index 坏了重建、存储区搬家、resolver 重写，调用方一行代码都不用改。
+接口保持简单，是为了让内部实现可以独立调整。调用方只依赖这三个方法；重建索引、迁移存储或重写冲突处理逻辑时，都不必改动调用方的代码。
 
-每一章的文件夹都带着这个文件和之前的所有代码，在同一个 `engine.py` 上一章一章往下长。
-diff 相邻两章的 `src/`，看到的就是那一章的机制。
+后续每章都会带上这个文件和前面的全部代码，在同一个 `engine.py` 上继续增加功能。对比相邻两章的 `src/`，就能看出这一章具体增加了什么。
 
 ---
 
-## 各系统做法
+## 各系统的做法
 
-Claude Code 和 Hermes 都是本机的单租户工具，所以 tenant 字段在它们身上看起来可有可无。
-track 的合约把它列为必填：production 是一套系统同时服务很多租户。
+Claude Code 和 Hermes 都是本地的单租户工具，因此不一定需要显式的租户字段。本教程面向一套系统服务多个租户的场景，所以把 `tenant_id` 设为必填。
 
 | | Claude Code | Hermes Agent |
 | --- | --- | --- |
-| **Pros** | memory 照项目分开存，repo 之间不会互相污染。 | 一份 profile 跟着用户走，在哪个渠道讲话都认得你。 |
-| **Cons** | 同一个用户跨项目的事实被拆散在不同存储区。 | 没有照项目分开：用户做的所有事都装在同一个桶里。 |
-| **Why** | memory 服务的是工作目录：context 就是项目。 | memory 服务的是关系：context 就是这个人。 |
-| **How: scope 单位** | 每个用户、每个项目目录各一份。 | 每个用户一份，跨渠道共用。 |
-| **How: 隔离** | 照项目路径分开的 memory 目录。 | 本机数据库里按用户分开的状态。 |
-| **How: 租户** | 单一租户：这台机器。 | 单一租户：架设者自己的部署。 |
+| **优点** | 按项目分别保存记忆，仓库之间不会混用信息。 | 用户画像跨渠道共用，无论从哪里交流，都能识别同一个用户。 |
+| **局限** | 同一个用户的信息可能分散在多个项目的存储目录中。 | 不按项目划分，用户在不同项目中的信息会存放在一起。 |
+| **设计考虑** | 记忆服务于当前工作目录，以项目作为上下文。 | 记忆服务于长期的用户关系，以用户作为上下文。 |
+| **归属范围** | 每个用户的每个项目目录各存一份。 | 每个用户一份，跨渠道共用。 |
+| **隔离方式** | 用项目路径区分记忆目录。 | 在本地数据库中按用户区分状态。 |
+| **租户边界** | 当前机器就是一个租户。 | 部署者自己的这套服务就是一个租户。 |
 
 ---
 
-## 哪里会出错
+## 常见问题
 
-- **完全没有 scope：**最经典的事故：A 用户的数据出现在 B 用户的对话里。
-  scope 是每个动词的必填参数，不是谁想到才加的过滤条件。
-- **scope 写在正文里：**「Marcus 的 staging key 是⋯」存进去了，却没挂在任何 user 底下。
-  过滤器读不懂正文。scope 是结构化字段，写入当下就要标好。
-- **scope 切太粗：**只切到 tenant，同一个 tenant 的用户就会看到彼此的数据。
-  user 和 agent 字段第一天就要放进去，就算暂时都是 `None`。
-- **调用方绕过接口：**某个 dashboard 直接查 index，从此 index 一重建，dashboard 就跟着坏。
-  所有读写都走那三个动词。
-- **只有接口、没有保证：**三个动词本身什么都不保证。
-  合约真正的内容是那条铁律（事件留着、view 可重建），后面每一章的测试就是在逐一验它。
+- **没有标明归属范围。** A 用户的数据可能被读到 B 用户的对话中。因此，每个接口都必须接收 `scope`，不能把隔离当成可选的过滤条件。
+- **只在正文里写归属。** 例如，保存了“Marcus 的测试环境密钥是……”这句话，却没有填写用户字段。过滤器不会从正文中判断数据归谁，必须在写入时填好结构化字段。
+- **范围划得太粗。** 如果只区分租户，同一租户的不同用户就可能看到彼此的数据。从一开始就应该保留用户和 agent 字段，即使暂时都填 `None`。
+- **调用方绕过接口。** 例如，监控面板直接查询索引，索引一重建，面板就出错。所有读写都应通过约定的三个方法。
+- **只有接口，没有行为保证。** 定义三个方法，并不等于系统已经可靠。真正要保证的是原始事件得到保留、视图能够重建，后续章节会逐项验证这些要求。
 
 ---
 
-## 可执行程序
+## 可运行的代码
 
-[`src/`](src/) 是整条链的起点，后面每一章都会带着它往下走：
+[`src/`](src/) 是后续代码的起点，包含：
 
-- [`contract.py`](src/contract.py)：`Scope` 和 `MemoryEngine` protocol。
-- [`test.py`](src/test.py)：验 scope 可以当 key、建好后不可改，用玩具 engine 验结构兼容，
-  再用迷你例子验按 scope 过滤的 recall。
+- [`contract.py`](src/contract.py)：定义 `Scope` 和 `MemoryEngine` 接口协议。
+- [`test.py`](src/test.py)：检查 `Scope` 能否作为字典键、创建后是否不可修改；用一个简化引擎检查接口兼容性，再用小例子验证检索是否按范围过滤。
 
 ```bash
 python sections/01-memory-contract/src/test.py   # offline checks, no key
 ```
 
-这一章完全不会调用模型，所以没有 `demo.py`。
+本章不调用模型，因此没有 `demo.py`。
 
 ---
 
-## 来源
+## 参考来源
 
-- [MemMachine](https://arxiv.org/abs/2604.04853)：把 memory 当成一个子系统，用同一个接口服务多个用户和 agent。
-- [Claude Code memory](https://docs.claude.com/en/docs/claude-code/memory)：按项目和按用户两种 scope 的文件式 memory。
-- [Production memory track](../../README.zh-CN.md)：这一章实现的第 1 章和核心抽象。
+- [MemMachine](https://arxiv.org/abs/2604.04853)：把记忆作为独立子系统，通过统一接口服务多个用户和 agent。
+- [Claude Code memory](https://docs.claude.com/en/docs/claude-code/memory)：按项目和用户划分范围的文件式记忆。
+- [生产环境中的记忆系统](../../README.zh-CN.md)：本章对应的第一阶段及核心接口设计。
