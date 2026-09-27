@@ -1,54 +1,55 @@
-# 4 · Typed memory
+# 4 · 记忆的分类（Typed memory）
 
 [English](README.md) · [繁體中文](README.zh-TW.md) · **简体中文**
 
-> 一个纯文本桶回答不了三种不同的问题。memory 要照「它回答什么」分型，也要照「系统怎么知道的」分型。
+> 保存一条记忆时，要说明它能用来回答什么问题，也要说明系统凭什么知道这件事。
 
-这一章讲 [Production memory](../../README.zh-CN.md) track 里 lifecycle 的 Encode：
-把通过 write gate（第 3 章）的 candidate，变成有类型、验证过的记录。
+本章对应[生产环境中的记忆系统](../../README.zh-CN.md)中的记录编码阶段：把第 3 章审核通过的候选记忆，转成有分类、经过验证的正式记录。
 
-不分型的存储区会把「上周二部署失败了」、「Marcus 主要写 Python」、
-「跑 schema migration 前先检查 migration lock」全部当成同一种东西：一段字符串。
-但这三句回答的问题不同，老化的方式不同，检索的方式也不同。
-存储区要是分不清「观察到的」和「模型自己猜的」，迟早会把猜测讲成事实。
+“上周二部署失败了”“Marcus 主要写 Python”“执行数据库结构迁移前，先检查迁移锁”，都是一段文字，但用途并不一样。它们回答不同的问题，过时的方式不同，检索时也需要区别处理。如果存储时完全不分类，后面就很难用好这些信息。
 
-文件式的 agent memory，分类标准通常是「什么值得留」（user、feedback、project、reference）。
-这一章改用「怎么用」来分：
+另外，亲自观察到的内容和模型推测的内容也必须分开。否则，系统迟早会把猜测当成事实说出来。
 
-1. 每笔记录归进一种功能 kind：发生过什么、现在相信什么、下次该怎么做。
-2. 另外记 epistemic type：这句是观察到的、验证过的、用户的偏好、系统推论的，还是主观意见。
-3. 构造时就验证。没有证据或类型不合法的记录，根本存不进来。
-4. 保留出处：每笔记录都能指回它来自哪些 source event。
+文件式记忆常按用户、反馈、项目、参考资料这四类保存，重点是判断“哪些东西值得留下”。本章则从使用方式出发：
+
+1. 按用途分类：记录发生过的事、当前掌握的知识，或下次可以采用的做法。
+2. 另加一组“信息依据”标签：原始观察、已确认事实、用户偏好、系统推论或主观意见。
+3. 创建记录时就验证，拒绝缺少证据或类型不合法的内容。
+4. 保留来源，让每条记忆都能追溯到原始事件。
 
 ---
 
-## 机制
+## 实现机制
 
-最简单的版本：两组 enum，加一个会验证的构造函数。
+最小实现包括两组枚举值，以及一个带验证的构造函数。
 
-三种功能 kind：
-
-```text
-episodic     发生过什么。「部署卡在 migration lock，最后靠 rollback 解决。」
-             时间、环境、结果都留着。它过时是变成历史，不是变成错的。
-semantic     现在相信什么。「Marcus 主要写 Python。」
-             从 episode 蒸馏出来，可以修：新证据能取代它。
-procedural   下次该怎么做。「跑 schema migration 前先检查 migration lock。」
-             workflow、runbook、gotcha。下次遇到类似情况就用得上。
-```
-
-epistemic type 是第二组标签，跟 kind 各管各的。kind 回答「要拿来做什么」，epistemic type 回答「我们怎么知道的」：
+第一组是用途类型，在代码中叫 `kind`：
 
 ```text
-evidence     原始观察，直接来自 ledger
-fact         验证过的，或用户亲口说的
-preference   用户想要什么；记的是偏好，不是事实
-inference    系统自己的猜测，可以修，而且要标明是猜的
-opinion      主观看法，系统永远不会悄悄把它升级成事实
+episodic     经历：发生过什么。
+             例如：“部署被迁移锁卡住，最后通过回滚解决。”
+             保留时间、环境和结果。事情过去了，它仍然是一段真实的历史。
+
+semantic     知识：目前认为成立的信息。
+             例如：“Marcus 主要写 Python。”
+             可以从经历中提炼，也可以根据新证据修订。
+
+procedural   操作流程：下次遇到类似情况该怎么做。
+             例如：“执行数据库结构迁移前，先检查迁移锁。”
+             包括工作流程、操作手册和需要留意的问题。
 ```
 
-记录把 kind、epistemic type 和出处绑在一起。
-`make_record` 是唯一的构造入口，所以只要记录存在，就一定验证过：
+第二组是信息依据，在代码中叫 `epistemic_type`。它和用途类型是两个独立维度：前者回答“凭什么知道”，后者回答“拿来做什么”：
+
+```text
+evidence     原始证据：直接来自事件日志的观察
+fact         已确认事实：经过验证，或由用户亲口说明
+preference   用户偏好：记录用户想要什么，不把偏好当成客观事实
+inference    系统推论：系统推测的结论，可以修订，也必须明确标注
+opinion      主观意见：保留意见的身份，不能在没有说明的情况下变成事实
+```
+
+一条记录同时包含用途、信息依据和来源。所有记录统一通过 `make_record` 创建，并在返回前完成验证：
 
 ```python
 @dataclass(frozen=True)
@@ -69,8 +70,7 @@ def make_record(scope, kind, epistemic_type, content, source_event_ids,
     return validate(MemoryRecord(...))
 ```
 
-验证跟第 3 章是同一套模式：规则写死的检查，一出错就直接抛异常。
-没有 source event 的记录直接退回，因为讲不出证据的 memory 就是谣言：
+验证方式与第 3 章相同：用固定规则检查，发现问题就抛出异常。没有来源事件的记录不能通过，因为系统无法给出它的证据：
 
 ```python
 def validate(record) -> MemoryRecord:
@@ -81,7 +81,7 @@ def validate(record) -> MemoryRecord:
         raise ValueError("a record without source events cannot cite its evidence")
 ```
 
-存储区照 kind 分流，照 scope 和 status 过滤。`grounded` 把知识和猜测切开：
+存储时按 `kind` 分类，读取时按归属范围和状态过滤。`grounded` 只选出原始证据与已确认事实，避免把推论混在其中：
 
 ```python
 def current(self, scope, kind) -> list[MemoryRecord]:
@@ -91,70 +91,59 @@ def grounded(records) -> list[MemoryRecord]:
     return [r for r in records if r.epistemic_type in ("evidence", "fact")]
 ```
 
-数据这样流：write gate（第 3 章）放行的 candidate 进到这一章，盖上 kind 和 epistemic type，变成正式的记录。
-之后 resolution（第 5 章）补上 bitemporal 字段（事情何时为真、何时记下），supersede 时改写 `status`。
-retrieval（第 8 章）按 kind 分路查询，context assembly（第 9 章）把 epistemic 标签印在内容旁边，
-让模型看得出哪些是观察、哪些是系统自己的推论。
+数据从第 3 章进入这里后，会补上用途类型和信息依据，成为正式记录。第 5 章再添加两组时间字段，分别说明内容在什么时候成立、系统在什么时候记录，并在替换旧记录时更新 `status`。
 
-### What Changed
+第 8 章检索时会按用途选择查询方式；第 9 章把记忆放进上下文时，会把信息依据标在内容旁边，让模型区分观察与推论。
 
-跟那套分类比，变的是问题本身：四种文件类型回答「值不值得留」，
-kind 回答「要拿来做什么」，epistemic type 回答「我们怎么知道的」。
-「值不值得留」的判断已经搬去第 3 章，这一章只管记录长什么样子。
-[Hindsight](https://arxiv.org/html/2512.12818v1) 划的是同一条线：发生过的事，永远不跟 agent 对它的想法混在一起。
+### 分类方式变在哪里
+
+用户、反馈、项目、参考资料这四类文件，主要回答“什么值得留下”。本章的两组标签分别回答“拿来做什么”和“凭什么知道”。是否值得保存，已经由第 3 章决定；这里负责把保存下来的内容组织成清楚的记录。
+
+[Hindsight](https://arxiv.org/html/2512.12818v1) 也强调类似的区分：实际发生的事情，要与 agent 对这些事情的看法分开。
 
 ---
 
-## 各系统做法
+## 各系统的做法
 
 | | LangMem | Hindsight |
 | --- | --- | --- |
-| **Pros** | 写入当下就照 app 自定义的 schema 验证。 | 发生过的事不会跟 agent 的想法混在一起。信念可以修，经验留着不动。 |
-| **Cons** | 类型帮得上多少忙，取决于 app 定义的 schema 好不好。 | 库分成四个，分流就变多；一分错，条目就落在错的库里。 |
-| **Why** | 每个 app 要存的 memory 都长得不一样，所以 schema 由 app 提供。 | 分不清观察和意见的 agent，会把猜测讲成事实。 |
-| **How: 类型** | semantic、episodic、procedural 三种 memory 类型。 | world fact、experience、observation、opinion 分成四个库。 |
-| **How: 单位** | 每个用户一份 profile 文件，或一批照 schema 验证的记录。 | 各库里分了型的条目，由 reflection 这道流程写入。 |
-| **How: 更新** | profile 就地修补；collection 新增或更新记录。 | reflection 读新证据、修订信念，并引用它读过的东西。 |
+| **优点** | 写入时按应用自定义的数据结构验证。 | 把实际经历与 agent 的看法分开；看法可以修订，经历保留不动。 |
+| **局限** | 类型能发挥多大作用，取决于应用的数据结构设计。 | 分成四个库后，分类工作更多；分错类型就会存入错误的库。 |
+| **设计考虑** | 不同应用需要不同的记忆结构，因此由应用定义结构。 | 只有区分观察与意见，才能避免把猜测当成事实。 |
+| **分类方式** | 知识（semantic）、经历（episodic）、操作流程（procedural）。 | 世界事实（world fact）、经历（experience）、观察（observation）、意见（opinion）四个库。 |
+| **记录单位** | 每个用户一份画像文件，或一组符合指定结构的记录。 | 各库中的分类条目，由反思流程写入。 |
+| **更新方式** | 直接修订画像，或在记录集合中新增、更新条目。 | 反思流程读取新证据、修订看法，并引用所依据的内容。 |
 
 ---
 
-## 哪里会出错
+## 常见问题
 
-- **什么都变成 semantic：**一桶装所有东西的存储区又悄悄回来了。写入时就要分流：
-  带时间戳的结果是 episodic，带触发条件的指示是 procedural。
-- **把推论存成事实：**系统会把模型的猜测当成事实讲出去。
-  所以 epistemic type 在构造时必填，assembly（第 9 章）还会把它印在内容旁边。
-- **有类型但没出处：**引用不了任何证据的记录，没办法查证、没办法取代，也不能信。
-  只要 `source_event_ids` 是空的，验证一律退回，没有例外。
-- **schema 一直改：**每加一个字段或新 kind，旧记录就对不上新 schema。
-  衍生记录都能从 ledger（第 2 章）重建，所以 schema 迁移只是重放一次，不用搬数据。
-- **procedure 丢了触发条件：**「检查 migration lock」少了「跑 schema migration 前」，
-  系统就不知道什么时候该用它，这条指令永远派不上用场。
-  procedural 记录要连条件一起留，不是只留指令。
+- **所有内容都归为知识。** 这样分类就失去了作用。写入时应区分：带时间和结果的事件属于经历，带适用条件的操作说明属于流程。
+- **把推论标成事实。** 模型的猜测可能因此被当成事实传播。创建记录时必须填写信息依据，第 9 章组装上下文时也要显示这个标签。
+- **有分类，没有来源。** 没有证据就无法核查、替换或信任这条记录。`source_event_ids` 为空时，一律拒绝。
+- **数据结构不断变化。** 新增字段或类型后，旧记录可能不再符合要求。由于这些记录都从第 2 章的原始事件派生，可以重新处理事件来生成新结构，不必逐条迁移旧记录。
+- **操作说明丢了适用条件。** 只保存“检查迁移锁”，却漏掉“执行数据库结构迁移前”，系统就不知道什么时候该使用它。流程类记忆要同时保留条件和操作。
 
 ---
 
-## 可执行程序
+## 可运行的代码
 
-[`src/`](src/) 接手 02 的整条代码链，再加入：
+[`src/`](src/) 在第 3 章的基础上增加：
 
-- [`records.py`](src/records.py)：两组 enum、`MemoryRecord`、`make_record`、`validate`、`grounded` 和 `TypedStore`。
-- [`engine.py`](src/engine.py)：通过 gate 的 candidate 在这里变成验证过的 typed record。
-  `observe()` 这条路到这里就完整了：event、gate、记录。
-- [`test.py`](src/test.py)：验证退回坏的 kind、epistemic type、置信度和没出处的记录；
-  kind 分流加 scope 隔离；grounded 的切分；status 控制哪些记录查得到；
-  engine 把过关的 candidate 存成 typed record，置信度沿用 gate 的决定。
+- [`records.py`](src/records.py)：两组枚举值、`MemoryRecord`、`make_record`、`validate`、`grounded` 和 `TypedStore`。
+- [`engine.py`](src/engine.py)：把审核通过的候选记忆转成经过验证的分类记录。至此，`observe()` 对应的写入流程已包含事件记录、写入审核和正式记忆。
+- [`test.py`](src/test.py)：检查错误类型、不合法置信度和缺少来源的记录是否被拒绝；验证分类读取、范围隔离、`grounded` 筛选与状态过滤；确认引擎保存的记录沿用审核决定中的置信度。
 
 ```bash
 python sections/04-typed-memory/src/test.py   # offline checks, no key
 ```
 
-这一章完全不会调用模型，所以没有 `demo.py`。
+本章不调用模型，因此没有 `demo.py`。
 
 ---
 
-## 来源
+## 参考来源
 
-- [Hindsight](https://arxiv.org/html/2512.12818v1)：fact、experience、observation、opinion 的 epistemic 切分。
-- [LangMem](https://github.com/langchain-ai/langmem)：照 schema 验证的 memory，profile 与 collection。
-- [Production memory track](../../README.zh-CN.md)：这一章所在的 lifecycle。
+- [Hindsight](https://arxiv.org/html/2512.12818v1)：区分事实、经历、观察和意见。
+- [LangMem](https://github.com/langchain-ai/langmem)：按指定数据结构验证记忆，提供用户画像与记录集合。
+- [生产环境中的记忆系统](../../README.zh-CN.md)：本章在整个记忆处理流程中的位置。

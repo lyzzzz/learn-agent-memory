@@ -1,7 +1,7 @@
 <h1 align="center" style="margin-top: 0;">Learn Agent Memory</h1>
 
 <p align="center">
-  <strong>了解 production 的 agent 是怎么记住东西的</strong><br>
+  <strong>看看实际运行的 agent 是怎样记住信息的</strong><br>
 </p>
 
 <p align="center">
@@ -15,104 +15,99 @@
   <a href="README.md">English</a> · <a href="README.zh-TW.md">繁體中文</a> · <strong>简体中文</strong>
 </p>
 
-Production 的 agent memory 不是一个向量数据库，而是一套系统：原始证据完整保留，查询用的 memory 都从证据整理出来，随时可以重建。
+给 agent 配上向量数据库，只是记忆系统的一部分。真正用于生产环境的系统，还要完整保存原始证据，再从证据中整理出便于查询的记忆。这样，即使整理过程出了错，也能重新生成。
 
-多数 agent 都跑同一套最小可行的 memory loop：一个文件存储区、一份索引、turn 开始时 recall、
-run 结束时 extraction，再加一份原始 session log。只管一个用户、一个 agent，那个 loop 就够了。
-但 production 的 memory 要面对多个 tenant、多个 agent，还有累积好几年的历史。
-到了这个规模，memory 本身就是一个子系统，有自己的 lifecycle、自己的时钟、自己的失效模式。
-这个 repo 把那个 loop 一章一章放大成完整的 memory 子系统，每一章对应一个设计决策。
+多数 agent 的基础做法差不多：用文件保存记忆，用索引查找；每轮对话开始前找出相关记忆，一次任务结束后提取新信息，同时保留原始会话日志。只有一个用户、一个 agent 时，这套流程就够用了。
 
-**目录：** [Memory pipeline](#memory-pipeline) · [学习方法](#学习方法) ·
+但在生产环境中，系统可能要同时服务多个租户、多个 agent，还要处理积累了好几年的历史记录。记忆因此成了一个独立的子系统：信息什么时候写入、什么时候更新、出了问题怎么恢复，都需要专门设计。这个仓库会用十章内容，把基础流程逐步扩展成完整的记忆系统，每章解决一个设计问题。
+
+**目录：** [记忆的处理流程](#记忆的处理流程) · [学习方法](#学习方法) ·
 [研究的系统](#研究的系统) · [各章节](#各章节) · [文件结构](#文件结构) · [运行检查](#运行检查)
 
 ---
 
-## Memory pipeline
+## 记忆的处理流程
 
-![Production memory pipeline](assets/production-memory.png)
+![生产环境中的记忆处理流程](assets/production-memory.png)
 
-整个设计最重要的一条规则：
+整套设计遵循一个基本原则：
 
-> 原始事件不可丢。整理出来的 memory 随时可以重建。
+> 保留原始事件，保证整理出来的记忆随时可以重建。
 
-Capture 之后的每一层都是 view：从事件算出来、给查询用的一份副本，永远不是唯一的一份。
-extraction、consolidation 或索引坏掉都没关系，从 event log 重新算一次就好。
-[MemMachine](https://arxiv.org/abs/2604.04853) 也是同样的立场：
-完整的 episode 留着当 ground truth，profile、索引和 contextual retrieval 都叠在上面。
+采集之后的每一层都是“视图”：从原始事件生成、方便查询的一份数据，而不是信息的唯一副本。提取、合并或索引出了问题，都可以从事件日志重新生成。
+[MemMachine](https://arxiv.org/abs/2604.04853) 也采用了这个思路：完整保存每段对话经历（episode），作为核对信息的依据；用户画像、索引和带上下文的检索都建立在这些原始记录之上。
 
-### 三条时钟
+### 哪些工作什么时候做
 
-同一套系统其实跑在三种节奏上：查询当下走 hot path，一次 run 结束走 warm path，后台整理走 cold path。
+系统里的工作分三个时机执行：查询时立即处理、任务结束后处理，以及放到后台处理。它们分别叫热路径（hot path）、温路径（warm path）和冷路径（cold path）。
 
-| | Hot path | Warm path | Cold path |
+| | 热路径：查询时 | 温路径：任务结束后 | 冷路径：后台处理 |
 | --- | --- | --- | --- |
-| **时机** | 每个 query | run 结束时 | 后台或调度 |
-| **工作** | plan、retrieve、rerank、assemble、inject | 写入原始事件、write gate、抽出 memory candidate | consolidate、去重、supersede、更新 profile、重建索引、评估 |
-| **限制** | 低 latency，严格的 token budget | 可以多一次 model call，但不能挡太久 | 可以慢，但必须安全 |
+| **执行时机** | 每次查询 | 一次任务运行结束时 | 后台运行或定时执行 |
+| **负责的工作** | 制定检索计划、检索、重新排序、组装上下文、把内容放入提示词 | 追加原始事件、审核写入、提取候选记忆 | 合并整理、去重、替换过期记忆、更新用户画像、重建索引、评估 |
+| **限制** | 响应要快，并严格控制 token 用量 | 可以多调用一次模型，但不能长时间阻塞 | 可以慢一些，但必须保证操作安全 |
 
-最小可行的 loop 已经有这个雏形：turn 前 recall、run 结束 extraction、后台 consolidation。
-这条 track 沿用同样的三条时钟，把每一条放大。
+基础流程其实已经有了这三个时机：对话前检索，任务结束后提取，后台合并整理。本教程会沿用这个安排，逐步补齐每个阶段需要的能力。
 
 ---
 
 ## 学习方法
 
-每一章都可独立阅读，都用同一组四个面向来看：
+每章都可以独立阅读，也都包含以下四部分：
 
-1. **开场：** 这一章要解决什么问题。
-2. **机制：** 有哪些组件，数据怎么流动。
-3. **各系统做法：** 真实系统是怎么实现的，整理成一张表。
-4. **哪里会出错：** 常见的出错情况，以及怎么缓解。
+1. **要解决的问题：** 这一章为什么有必要。
+2. **实现机制：** 需要哪些组件，数据怎样在它们之间流转。
+3. **各系统的做法：** 用表格对比实际系统的实现。
+4. **常见问题：** 哪些地方容易出错，怎么避免或处理。
 
-怎么从这个 repo 学习：
+建议这样阅读和练习：
 
-- **按顺序读各章节。每一章都建立在前一章之上**。
-- 每一章都能跑离线检查：`python sections/NN-name/src/test.py`，不需要密钥。
-- 把某章的 `src/` 跟前一章对比（diff），这个差异就是这一章新增的那个机制。
+- **按章节顺序读。** 代码会在上一章的基础上逐步增加功能。
+- 运行每章的离线检查：`python sections/NN-name/src/test.py`。不需要 API 密钥。
+- 对比相邻两章的 `src/` 目录。两者的代码差异，就是这一章新增的机制。
 
 ---
 
 ## 研究的系统
 
-每个系统都是所列章节 per-system 表格里的实现示例。
+下面这些系统会出现在相应章节的对比表中，帮助你理解同一个问题有哪些不同的解决办法。
 
-| 系统 | 大家为什么用它 | 值得看的地方 | 覆盖章节 |
+| 系统 | 大家为什么用它 | 值得关注的设计 | 涉及章节 |
 | --- | --- | --- | --- |
-| **[Claude Code](https://docs.claude.com/en/docs/claude-code/memory)** | 目前最强的 coding agent，auto memory 以 project 目录为单位存 markdown 文件。 | Scoped store、后台 consolidation | 1、5 |
-| **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** | 长期助理：记得你、学会你的工作流程，还能跨平台跑任务。 | 原始 session log、需要批准的写入 | 1、2、3 |
-| **[MemMachine](https://arxiv.org/abs/2604.04853)** | 开源的 memory 层，完整的对话 episode 留着当 ground truth。 | Episode ledger、contextual retrieval | 2、8 |
-| **[Mem0](https://arxiv.org/abs/2504.19413)** | 被广泛使用的 memory 层，store 走精选路线：新事实并进去，不是一直堆。 | LLM write gate | 3 |
-| **[LangMem](https://github.com/langchain-ai/langmem)** | LangChain 的 memory SDK，record 写入时会过 app schema 检查。 | Typed record 和 profile | 4 |
-| **[Hindsight](https://arxiv.org/html/2512.12818v1)** | 把事实、观察和意见分开存的 memory engine。 | Epistemic type、reflection | 4 |
-| **[Graphiti / Zep](https://arxiv.org/abs/2501.13956)** | temporal knowledge graph memory：旧事实标成过期留着，不会被盖掉。 | Bitemporal 字段、`SUPERSEDE` | 5 |
-| **[A-Mem](https://arxiv.org/html/2502.12110v1)** | agentic memory：新 note 会自己链接并更新旧 note。 | Dynamic linking、agentic consolidation | 6 |
-| **[Sleep-time Compute](https://arxiv.org/html/2504.13171v1)** | 把 consolidation 移出查询的 hot path，改在后台做。 | Cold path 的 consolidation | 6 |
-| **[AgentRunbook-C](https://arxiv.org/abs/2605.12493)** | 把 trajectory 存成文件，让 coding agent 在 sandbox 里自己搜索。 | Agentic file retrieval | 8 |
+| **[Claude Code](https://docs.claude.com/en/docs/claude-code/memory)** | 当前编程能力最强的 agent，自动记忆功能按项目目录保存 Markdown 文件。 | 按范围隔离存储、后台合并整理 | 1、5 |
+| **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** | 适合长期使用的助理：记住用户、学习工作流程，还能跨平台执行任务。 | 原始会话日志、写入审批 | 1、2、3 |
+| **[MemMachine](https://arxiv.org/abs/2604.04853)** | 开源记忆层，保留完整对话经历，作为原始证据。 | 对话记录、带上下文的检索 | 2、8 |
+| **[Mem0](https://arxiv.org/abs/2504.19413)** | 使用广泛的记忆层，会把新事实合入已有记忆，避免记录不断堆积。 | 由大语言模型判断如何写入 | 3 |
+| **[LangMem](https://github.com/langchain-ai/langmem)** | LangChain 的记忆 SDK，写入时按应用定义的数据结构校验记录。 | 分类记录、用户画像 | 4 |
+| **[Hindsight](https://arxiv.org/html/2512.12818v1)** | 把事实、观察和意见分开保存的记忆引擎。 | 区分信息依据、通过反思修订记忆 | 4 |
+| **[Graphiti / Zep](https://arxiv.org/abs/2501.13956)** | 用时间知识图谱保存记忆。旧事实会被标为失效，同时保留历史。 | 两组时间字段、`SUPERSEDE` 操作 | 5 |
+| **[A-Mem](https://arxiv.org/html/2502.12110v1)** | 由 agent 自主整理记忆：新笔记会关联旧笔记，并更新相关内容。 | 动态建立链接、自主合并整理 | 6 |
+| **[Sleep-time Compute](https://arxiv.org/html/2504.13171v1)** | 把记忆整理放到后台，减少查询时的等待。 | 在冷路径中整理记忆 | 6 |
+| **[AgentRunbook-C](https://arxiv.org/abs/2605.12493)** | 把执行过程存成文件，让编程 agent 在沙箱里自行搜索。 | 由 agent 自主检索文件 | 8 |
 
-> 第 7 到 10 章比较的是设计模式（wiki 对 graph view、retrieval 策略、assembly 政策、指标），不是单一系统。
+> 第 7 到 10 章侧重比较设计方式，包括 wiki 与图视图、检索策略、上下文组装规则和评估指标，不围绕某一个系统展开。
 
 ---
 
 ## 各章节
 
-十章，每一章都是一个独立的设计决策。每一行都连到一篇可独立阅读、附可执行代码的说明。
+全书共十章。每章讨论一个设计问题，附有可以独立阅读的说明和可运行的代码。
 
-| #  | 章节                                                                     | 问题                             | 关键机制                                                   |
-| -- | ------------------------------------------------------------------------ | -------------------------------- | ---------------------------------------------------------- |
-|    | **Extraction** | | |
-| 1  | [Memory contract](sections/01-memory-contract/README.zh-CN.md)                     | 这是谁的 memory？                | Scope, tenant and user isolation, retention, sensitivity   |
-| 2  | [Event ledger](sections/02-event-ledger/README.zh-CN.md)                           | 什么算是证据？                   | Append-only log, `occurred_at` vs `recorded_at`            |
-| 3  | [Write policy](sections/03-write-policy/README.zh-CN.md)                           | 值不值得记？                     | Novelty, durability, explicit write decisions              |
-| 4  | [Typed memory](sections/04-typed-memory/README.zh-CN.md)                           | 这是哪一种 memory？              | Episodic, semantic, procedural, epistemic types            |
-|    | **Consolidation** | | |
-| 5  | [Temporal resolution](sections/05-temporal-resolution/README.zh-CN.md)             | 是矛盾，还是更新？               | Bitemporal fields, `SUPERSEDE`, non-destructive operations |
-| 6  | [Consolidation](sections/06-consolidation/README.zh-CN.md)                         | 事件怎么变成知识？               | Compression, abstraction, propose-validate-commit          |
-| 7  | [Index views](sections/07-index-views/README.zh-CN.md)                             | 一份 ledger 怎么支撑多种查法？   | Sparse, dense, temporal, graph, wiki, profile views        |
-|    | **Recall** | | |
-| 8  | [Hybrid retrieval](sections/08-hybrid-retrieval/README.zh-CN.md)                   | 怎么找到对的 memory？            | BM25 plus vector plus graph, source expansion, routing     |
-| 9  | [Context assembly](sections/09-context-assembly/README.zh-CN.md)                   | memory 怎么安全放回 context？    | Evidence bundles, token budget, untrusted-data framing     |
-| 10 | [Evaluation and governance](sections/10-evaluation-governance/README.zh-CN.md)     | memory 真的帮上忙了吗？          | Write, retrieval, context, and end-to-end metrics          |
+| # | 章节 | 要回答的问题 | 关键机制 |
+| --- | --- | --- | --- |
+| | **提取记忆** | | |
+| 1 | [记忆系统的接口约定](sections/01-memory-contract/README.zh-CN.md) | 这份记忆属于谁？ | 数据范围、租户与用户隔离、保留策略、敏感程度 |
+| 2 | [原始事件记录](sections/02-event-ledger/README.zh-CN.md) | 什么能作为证据？ | 只追加的日志、事件发生时间与系统记录时间 |
+| 3 | [写入策略](sections/03-write-policy/README.zh-CN.md) | 哪些信息值得记住？ | 信息是否新增、是否长期有用、明确记录写入决定 |
+| 4 | [记忆的分类](sections/04-typed-memory/README.zh-CN.md) | 这条记忆有什么用途、依据是什么？ | 经历、知识、操作流程，以及信息依据的分类 |
+| | **整理记忆** | | |
+| 5 | [处理时间与冲突](sections/05-temporal-resolution/README.zh-CN.md) | 信息矛盾了，还是情况变了？ | 双时间模型、`SUPERSEDE`、保留历史的操作 |
+| 6 | [合并与整理](sections/06-consolidation/README.zh-CN.md) | 怎样从事件中整理出知识？ | 压缩、归纳、提出方案后验证再执行 |
+| 7 | [索引与视图](sections/07-index-views/README.zh-CN.md) | 同一份事件记录怎样支持多种查询？ | 稀疏索引、向量索引、时间、图、wiki 和用户画像视图 |
+| | **检索并使用记忆** | | |
+| 8 | [混合检索](sections/08-hybrid-retrieval/README.zh-CN.md) | 怎样找到需要的记忆？ | BM25、向量与图检索，补充来源上下文，选择检索方式 |
+| 9 | [组装上下文](sections/09-context-assembly/README.zh-CN.md) | 怎样把记忆安全地交给模型？ | 完整的证据信息、token 预算、明确标为不可信的参考数据 |
+| 10 | [评估与管理](sections/10-evaluation-governance/README.zh-CN.md) | 记忆到底有没有帮上忙？ | 写入、检索、上下文和端到端效果的评估指标 |
 
 ---
 
@@ -120,25 +115,24 @@ extraction、consolidation 或索引坏掉都没关系，从 event log 重新算
 
 ```text
 learn-agent-memory/
-├── README.md                      # 最上层地图
-├── sections/                      # 每个章节一个文件夹
-│   ├── 01-memory-contract/        # 每章一份 README.md，可执行的代码链从这里开始
+├── README.md                      # 项目总览
+├── sections/                      # 每章一个文件夹
+│   ├── 01-memory-contract/        # 从这里开始逐章实现，每章都有 README.md
 │   ├── ...
-│   └── 10-evaluation-governance/  # 完整的 engine 在这里
+│   └── 10-evaluation-governance/  # 完整的记忆引擎
 └── assets/                        # 共用图片
 ```
 
-每个章节文件夹都是 `NN-name/` 格式，里面有 `README.md`、`README.zh-TW.md`、`README.zh-CN.md`，还有可执行的 `src/`。
-每一章都把前一章的 `src/` 带过来，再加上一个新机制，
-所以相邻两章的 diff 就是那一章的机制，第 10 章就是完整的 engine。
+章节目录统一命名为 `NN-name/`。每个目录都有英文、繁体中文、简体中文三份 README，以及可以运行的 `src/` 代码。
+每章保留上一章的代码，再增加一个机制。因此，对比相邻两章就能看出新增功能；第 10 章包含完整的记忆引擎。
 
 ---
 
 ## 运行检查
 
-所有代码都是 stdlib Python（dataclasses、sqlite3）。没有第三方依赖，不需要 API key，也不用安装。
+代码只使用 Python 标准库，例如 `dataclasses` 和 `sqlite3`，没有第三方依赖。不需要 API 密钥，也不需要额外安装包。
 
-每一章都有 `test.py` 做离线检查。从 repo 根目录运行：
+每章都有一个 `test.py`，用于离线检查。从仓库根目录运行即可，例如：
 
 ```bash
 python sections/01-memory-contract/src/test.py
@@ -148,24 +142,23 @@ python sections/01-memory-contract/src/test.py
 
 ## 参与贡献
 
-- **新增一个系统。** 把新的 memory 系统放进某一章的 per-system 表格里。
-- **深化某一章。** 补上一个机制、更清楚的图，或更精准的出错分析。
-- **修正内容。** 这些页面都是从论文和文档重建出来的教学内容。欢迎附上出处的修正。
+- **补充系统实例。** 在相关章节的对比表中加入其他记忆系统。
+- **完善章节。** 补充实现机制、改进图示，或更准确地分析出错原因。
+- **修正内容。** 这些教学说明是根据论文和文档整理的，欢迎附上出处来纠正问题。
 
-请优先采用有名字、可查证的机制，而不是臆测。记得引用出处。
+请尽量使用已有名称、能够查证的机制，并注明来源，避免只凭猜测描述实现。
 
 ---
 
 ## 参考资料
 
-- [MemMachine](https://arxiv.org/abs/2604.04853)：主张保留 ground truth 的 memory 系统，retrieval 时带出完整 episode 的前后文。
-- [Zep / Graphiti](https://arxiv.org/abs/2501.13956)：用 temporal knowledge graph 做 agent memory，事实带两种时间。
-- [Hindsight](https://arxiv.org/html/2512.12818v1)：retain、recall、reflect 三步，把事实、观察和意见分开存。
-- [A-Mem](https://arxiv.org/html/2502.12110v1)：agentic memory，新 note 会自己链接并更新旧 note。
-- [Memory-R1](https://arxiv.org/html/2508.19828v2)：用 RL 训练 memory manager，学着选 `ADD / UPDATE / DELETE / NOOP`。
-- [Sleep-time Compute](https://arxiv.org/html/2504.13171v1)：趁没有 query 时在后台先整理，省下查询当下的成本。
-- [Karpathy 的 LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：idea file 原文。
-  由 LLM 维护的 markdown wiki，原始来源永远不动，页面都从它整理出来。
-- [HippoRAG](https://arxiv.org/abs/2405.14831)：knowledge graph 加 Personalized PageRank，要串好几步的证据一次就查齐。
-- [LongMemEval](https://arxiv.org/abs/2410.10813)：长期交互 memory 的 benchmark，五类任务。
-- [LongMemEval-V2](https://arxiv.org/abs/2605.12493)：把 benchmark 扩到 agent 的工作经验，AgentRunbook-C 的文件式检索出自这里。
+- [MemMachine](https://arxiv.org/abs/2604.04853)：保留原始证据，检索时补充命中内容所在对话的完整上下文。
+- [Zep / Graphiti](https://arxiv.org/abs/2501.13956)：用时间知识图谱保存 agent 记忆，每条事实记录两种时间。
+- [Hindsight](https://arxiv.org/html/2512.12818v1)：通过保留、检索、反思三个步骤，把事实、观察和意见分开管理。
+- [A-Mem](https://arxiv.org/html/2502.12110v1)：由 agent 自主整理记忆，新笔记会关联并更新旧笔记。
+- [Memory-R1](https://arxiv.org/html/2508.19828v2)：用强化学习训练记忆管理器，让它学习选择 `ADD / UPDATE / DELETE / NOOP`。
+- [Sleep-time Compute](https://arxiv.org/html/2504.13171v1)：利用没有查询的空闲时间预先整理，减少查询时的计算成本。
+- [Karpathy 的 LLM Wiki](https://gist.github.com/karpathy/442a6bf555914893e9891c11519de94f)：原始构想文件。由大语言模型维护 Markdown wiki，保留原始来源，页面内容都从来源中整理。
+- [HippoRAG](https://arxiv.org/abs/2405.14831)：结合知识图谱和个性化 PageRank，一次检索找齐需要跨多层关系关联的证据。
+- [LongMemEval](https://arxiv.org/abs/2410.10813)：评估长期交互记忆的基准，包含五类任务。
+- [LongMemEval-V2](https://arxiv.org/abs/2605.12493)：把评估范围扩展到 agent 的工作经验，AgentRunbook-C 的文件检索方法也来自这项工作。
